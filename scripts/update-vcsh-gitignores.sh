@@ -1,4 +1,4 @@
-for repo in nano; do
+for repo in $(vcsh list); do
   vcsh write-gitignore $repo
   vcsh $repo add -f .gitignore.d/$repo
   vcsh write-gitignore $repo
