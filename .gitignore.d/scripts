@@ -1,7 +1,7 @@
 *
 !/.gitignore.d
 !/.gitignore.d/scripts
-!/scripts
-!/scripts/brew-cask-cleanup.rb
-!/scripts/gitstandup.sh
-!/scripts/update-vcsh-gitignores.sh
+!/.scripts
+!/.scripts/brew-cask-cleanup.rb
+!/.scripts/gitstandup.sh
+!/.scripts/update-vcsh-gitignores.sh
