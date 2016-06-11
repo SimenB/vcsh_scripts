@@ -1,3 +1,5 @@
+# https://github.com/RichiH/vcsh/issues/133
+
 for repo in $(vcsh list); do
   vcsh write-gitignore $repo
   vcsh $repo add -f .gitignore.d/$repo
