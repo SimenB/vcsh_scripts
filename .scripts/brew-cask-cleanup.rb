@@ -5,7 +5,7 @@
 # Requirements:
 #   brew install trash
 
-casks_path = '/opt/homebrew-cask/Caskroom'
+casks_path = '/usr/local/Caskroom'
 
 class Version < Array
   def initialize s
