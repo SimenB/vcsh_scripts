@@ -1,4 +1,4 @@
-#!ruby
+#!/usr/bin/env ruby
 
 # https://gist.github.com/orangeudav/26a8752ae54a169b8516
 
