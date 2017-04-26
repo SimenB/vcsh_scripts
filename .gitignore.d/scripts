@@ -4,5 +4,6 @@
 !/.scripts
 !/.scripts/brew-cask-cleanup.rb
 !/.scripts/do-tmp.sh
+!/.scripts/exec-kubectl.sh
 !/.scripts/gitstandup.sh
 !/.scripts/update-vcsh-gitignores.sh
