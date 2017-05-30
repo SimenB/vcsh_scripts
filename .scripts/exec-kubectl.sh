@@ -19,6 +19,6 @@ all_pods=$(kubectl --context "$context" get pods --selector "$selector" --output
 
 for pod in $all_pods
 do
-  kubectl --context "$context" exec "$pod" -- "${command[@]}" > "$pod".txt
+  kubectl --context "$context" exec "$pod" -- "${command[@]}" > "$pod".txt || echo Failed executing command in "$pod"
 done
 
