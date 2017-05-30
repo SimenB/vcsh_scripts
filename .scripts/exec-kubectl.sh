@@ -15,7 +15,7 @@ selector="$2"
 # Make single string into array
 command=("$3")
 
-all_pods=$(kubectl --context "$context" get pods --selector "$selector" --output name | sed 's/pods\///')
+all_pods=$(kubectl --context "$context" get pods --selector "$selector" --output json | jq -r '.items[].metadata.name')
 
 for pod in $all_pods
 do
