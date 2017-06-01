@@ -6,6 +6,8 @@
 
 set -e
 
+start_time=$(date +%H%M%S)
+
 if [ $# -lt 3 ]; then
   echo 'provide context, selector and command to run'
   exit 1
@@ -16,9 +18,16 @@ selector="$2"
 command=("$3")
 
 all_pods=$(kubectl --context "$context" get pods --selector "$selector" --output json | jq -r '.items[].metadata.name')
+pod_file_names=()
 
 for pod in $all_pods
 do
-  kubectl --context "$context" exec "$pod" -- sh -c "${command[@]}" > "$pod".txt && echo "$pod" complete || echo Failed executing command in "$pod"
+  pod_name="$pod".txt
+  pod_file_names+=("$pod_name")
+
+  kubectl --context "$context" exec "$pod" -- sh -c "${command[@]}" > "$pod_name" && echo "$pod" complete || echo Failed executing command in "$pod"
 done
 
+tarball_name="$start_time".tar.gz
+tar czf "$tarball_name" "${pod_file_names[@]}"
+echo Packaged in "$tarball_name"
