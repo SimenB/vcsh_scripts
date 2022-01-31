@@ -1,7 +1,5 @@
 *
-!/.gitignore.d
 !/.gitignore.d/scripts
-!/.scripts
 !/.scripts/brew-cask-cleanup.rb
 !/.scripts/do-tmp.sh
 !/.scripts/exec-kubectl.sh
