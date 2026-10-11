@@ -1,0 +1,11 @@
+#!/bin/sh
+# Emit an mr config section for every git clone directly under ~/repos.
+# Worktrees (where .git is a file) are skipped: git-ff-all updates them via their main clone.
+# A clone with `mr.skip` set to anything is left out entirely (`true` by hand, `archived` by git-pr-cleanup).
+for dir in "$HOME"/repos/*/; do
+  dir=${dir%/}
+  [ -d "$dir/.git" ] || continue
+  [ -n "$(git -C "$dir" config --get mr.skip)" ] && continue
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || continue
+  printf '[%s]\ncheckout = git clone %s %s\nupdate = git ff-all && git pr-cleanup\n\n' "$dir" "$url" "$(basename "$dir")"
+done

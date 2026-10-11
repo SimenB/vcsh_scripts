@@ -1,0 +1,219 @@
+#!/bin/sh
+# Clean up branches and worktrees whose work has landed.
+# A branch has landed when its tip is reachable from the remote default branch (origin's, or the
+# parent's on a fork; a merge that exists only locally does not count), or when its tip is
+# the head commit of a merged pull request (squash and rebase merges), found among the repo's
+# last 1000 merged PRs. Branch author and fork owner do not matter; the PR's base may be any
+# branch, not only the default one.
+#
+# Checked-out landed branches: the main clone switches to the branch it landed in; a hand-made
+# worktree (named *-worktree) goes to its resting branch `worktree`, reset onto that branch,
+# unless `worktree` has commits of its own; any other linked worktree is removed. The landed
+# branch is deleted with branch -D, so its reflog goes with it; the commits remain on the PR.
+# Landed branches not checked out anywhere are deleted. A branch whose upstream is gone also counts
+# as landed when the merged PR of its upstream branch has the local tip in its history; otherwise it is
+# reported, not deleted.
+# Detached worktrees under .claude/worktrees/ untouched for 14 days (by their HEAD and index
+# files) whose commit is on some branch are removed. A linked worktree is never removed while it
+# holds ignored files outside build and dependency directories, such as an .env or IDE state.
+# Dirty worktrees, the default branch, resting branches, and branches with branch.<name>.mrIgnore
+# are left alone. Nothing runs when origin is not on GitHub or origin/HEAD does not name a branch
+# that exists on the remote (origin/HEAD is refreshed first when its branch is missing locally or
+# on the remote). Without a local copy of the default branch, only the main-clone switch is skipped. A clone whose origin is
+# archived on GitHub is marked mr.skip=archived so later runs skip it (mr-daily un-marks it if
+# GitHub unarchives it). A resting branch gets pushRemote=no_push so a stray `git push` cannot
+# tie it to a PR again.
+# Usage: git pr-cleanup [--dry-run]
+set -e
+# GitHub calls get a two-minute cap so a stalled connection cannot hang the run, and one retry
+# for a dropped connection. Every call here is a read.
+gh() { gtimeout 120 "$(command -v gh)" "$@" || { sleep 5; gtimeout 120 "$(command -v gh)" "$@"; }; }
+dry_run=
+[ "$1" = "--dry-run" ] && dry_run=1
+tab=$(printf '\t')
+
+origin_url=$(git remote get-url origin)
+case "$origin_url" in *github.com[:/]*) ;; *) exit 0 ;; esac
+slug=$(echo "$origin_url" | sed -E 's#.*github.com[:/]##; s#\.git$##')
+info=$(gh api "repos/$slug" --jq '(if .fork then .parent.full_name else .full_name end) + " " + (.archived|tostring)')
+repo=${info%% *}
+if [ "${info##* }" = true ]; then
+  [ -n "$dry_run" ] || git config mr.skip archived
+  echo "archived  $slug is archived on GitHub: marked mr.skip, the daily job will leave it alone"
+  exit 0
+fi
+main_worktree=$(git rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')
+default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+if [ -z "$default_branch" ] || ! git show-ref --quiet "refs/heads/$default_branch" || ! git show-ref --quiet "refs/remotes/origin/$default_branch"; then
+  git remote set-head origin --auto >/dev/null 2>&1 || true
+  default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+fi
+if [ -z "$default_branch" ] || ! git show-ref --quiet "refs/remotes/origin/$default_branch"; then
+  echo "skip  cleanup: origin has no usable default branch (origin/HEAD is '${default_branch:-unset}')"
+  exit 0
+fi
+# Landed means reachable from the remote copy of the default branch, never from local-only merges.
+remote_default="origin/$default_branch"
+upstream_name=$(git config --get remote.upstream.fetch 2>/dev/null | sed -nE 's#^\+?refs/heads/([^:*]+):.*#\1#p')
+[ -n "$upstream_name" ] && git rev-parse --verify --quiet "refs/remotes/upstream/$upstream_name" >/dev/null && remote_default="upstream/$upstream_name"
+merged_prs=$(gh pr list -R "$repo" --state merged --limit 1000 --json number,baseRefName,headRefOid,headRefName \
+  --jq '.[] | .headRefOid + " " + .baseRefName + " " + (.number|tostring) + " " + .headRefName')
+
+# landed_in <branch>: prints the branch the work landed in, or nothing.
+landed_in() {
+  tip=$(git rev-parse "refs/heads/$1")
+  if git merge-base --is-ancestor "$tip" "$remote_default"; then
+    echo "$default_branch"
+    return
+  fi
+  echo "$merged_prs" | awk -v tip="$tip" '$1 == tip { print $2 " (PR " $3 ")"; exit }'
+}
+
+# landed_via_pr_head <branch> <upstream branch name>: for each merged PR whose head branch is the
+# upstream name (same-named heads from other forks included), fetch the PR head and print the base
+# of the first one that has the local tip in its history (the PR gained commits after the local tip).
+landed_via_pr_head() {
+  echo "$merged_prs" | awk -v name="$2" '$4 == name { print $2 " " $3 }' |
+  while read -r base number; do
+    git fetch --quiet "git@github.com:$repo.git" "refs/pull/$number/head" 2>/dev/null || continue
+    if git merge-base --is-ancestor "refs/heads/$1" FETCH_HEAD; then
+      echo "$base (PR $number)"
+      break
+    fi
+  done
+  return 0
+}
+
+is_ignored() { [ "$(git config --get "branch.$1.mrIgnore")" = true ]; }
+is_dirty() { [ -n "$(git -C "$1" status --porcelain --untracked-files=no)" ]; }
+has_untracked() { git -C "$1" status --porcelain --untracked-files=all | grep -q "^??"; }
+# Every commit the worktree's HEAD has pointed at is on some branch.
+reflog_on_branches() {
+  ! git -C "$1" log -g --format=%H HEAD 2>/dev/null | sort -u |
+    while read -r commit; do on_some_branch "$commit" || echo no; done | grep -q no
+}
+on_some_branch() { git for-each-ref --contains "$1" refs/heads refs/remotes | grep -q .; }
+# Ignored files a worktree removal would destroy, other than build and dependency output.
+precious_ignored() {
+  git -C "$1" status --porcelain --ignored --untracked-files=all | sed -n 's/^!! //p' |
+    grep -vE '^(node_modules|\.yarn|target|vendor|dist|build|out|tmp|coverage|\.cache|\.next|\.turbo|\.parcel-cache)/' | head -3
+}
+
+git worktree prune
+
+# Checked-out branches.
+git worktree list --porcelain | awk '/^worktree /{w=$2} /^branch /{sub("refs\\/heads\\/","",$2); print w "\t" $2}' |
+while IFS="$tab" read -r worktree branch; do
+  [ "$branch" = "$default_branch" ] && continue
+  [ "$branch" = worktree ] && continue
+  is_ignored "$branch" && continue
+  landed=$(landed_in "$branch")
+  [ -z "$landed" ] && continue
+  base=${landed%% *}
+  if is_dirty "$worktree"; then
+    echo "skip  $branch: landed in $landed but worktree is dirty: $worktree"
+    continue
+  fi
+  if ! git show-ref --quiet "refs/heads/$base"; then
+    base_remote="origin/$base"
+    [ "$base" = "$default_branch" ] && base_remote=$remote_default
+    if ! git rev-parse --verify --quiet "refs/remotes/$base_remote" >/dev/null; then
+      echo "skip  $branch: landed in $landed but no local or remote branch $base: $worktree"
+      continue
+    fi
+  fi
+  case "$worktree" in
+    "$main_worktree")
+      if git show-ref --quiet "refs/heads/$base"; then
+        echo "switch  $branch -> $base in $worktree ($landed)"
+        [ -n "$dry_run" ] && continue
+        git -C "$worktree" checkout --quiet "$base"
+      else
+        echo "switch  $branch -> new local $base from $base_remote in $worktree ($landed)"
+        [ -n "$dry_run" ] && continue
+        git -C "$worktree" checkout --quiet -b "$base" "$base_remote"
+      fi
+      ;;
+    *-worktree)
+      if ! git show-ref --quiet "refs/heads/$base"; then
+        echo "skip  $branch: landed in $landed but no local branch $base: $worktree"
+        continue
+      fi
+      if git show-ref --quiet refs/heads/worktree && ! git merge-base --is-ancestor worktree "$base"; then
+        echo "skip  $branch: landed in $landed but resting branch worktree has commits of its own: $worktree"
+        continue
+      fi
+      echo "switch  $branch -> worktree (at $base) in $worktree ($landed)"
+      [ -n "$dry_run" ] && continue
+      git -C "$worktree" checkout -B worktree --quiet "$base"
+      git config branch.worktree.pushRemote no_push
+      ;;
+    *)
+      if has_untracked "$worktree"; then
+        echo "skip  $branch: landed in $landed but worktree holds untracked files: $worktree"
+        continue
+      fi
+      precious=$(precious_ignored "$worktree")
+      if [ -n "$precious" ]; then
+        echo "skip  $branch: landed in $landed but worktree holds ignored files ( $(echo "$precious" | tr '\n' ' ')): $worktree"
+        continue
+      fi
+      echo "remove  $worktree ($branch landed in $landed)"
+      [ -n "$dry_run" ] && continue
+      git worktree remove "$worktree"
+      ;;
+  esac
+  git branch -D --quiet "$branch"
+done
+
+# Branches not checked out anywhere.
+git for-each-ref --format='%(refname:short)%09%(if)%(worktreepath)%(then)%(worktreepath)%(else)-%(end)%09%(if)%(upstream:track)%(then)%(upstream:track)%(else)-%(end)%09%(if)%(upstream:short)%(then)%(upstream:short)%(else)-%(end)' refs/heads |
+while IFS="$tab" read -r branch worktree track upstream; do
+  [ "$worktree" != - ] && continue
+  [ "$branch" = "$default_branch" ] && continue
+  [ "$branch" = worktree ] && continue
+  is_ignored "$branch" && continue
+  landed=$(landed_in "$branch")
+  if [ -n "$landed" ]; then
+    echo "delete  $branch (landed in $landed)"
+    [ -n "$dry_run" ] || git branch -D --quiet "$branch"
+  elif [ "$track" = "[gone]" ]; then
+    landed=$(landed_via_pr_head "$branch" "${upstream#*/}")
+    if [ -n "$landed" ]; then
+      echo "delete  $branch (landed in $landed, PR head had later commits)"
+      [ -n "$dry_run" ] || git branch -D --quiet "$branch"
+    else
+      echo "gone  $branch: its upstream was deleted but its commits have not landed"
+    fi
+  fi
+done
+
+# Stale detached worktrees left behind by Claude sessions.
+cutoff=$(( $(date +%s) - 14 * 86400 ))
+git worktree list --porcelain | awk '/^worktree /{w=$2} /^detached$/{print w}' |
+while read -r worktree; do
+  case "$worktree" in */.claude/worktrees/*) ;; *) continue ;; esac
+  head=$(git -C "$worktree" rev-parse HEAD)
+  admin=$(git -C "$worktree" rev-parse --absolute-git-dir)
+  last_used=$(stat -f %m "$admin/HEAD" "$admin/index" 2>/dev/null | sort -n | tail -1)
+  [ "${last_used:-0}" -lt "$cutoff" ] || continue
+  if is_dirty "$worktree"; then
+    echo "skip  stale detached worktree is dirty: $worktree"
+    continue
+  fi
+  if has_untracked "$worktree"; then
+    echo "skip  stale detached worktree holds untracked files: $worktree"
+    continue
+  fi
+  if ! on_some_branch "$head" || ! reflog_on_branches "$worktree"; then
+    echo "skip  stale detached worktree has commits on no branch: $worktree"
+    continue
+  fi
+  precious=$(precious_ignored "$worktree")
+  if [ -n "$precious" ]; then
+    echo "skip  stale detached worktree holds ignored files ( $(echo "$precious" | tr '\n' ' ')): $worktree"
+    continue
+  fi
+  echo "remove  $worktree (detached, idle for more than 14 days)"
+  [ -n "$dry_run" ] || git worktree remove "$worktree"
+done

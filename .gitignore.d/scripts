@@ -1,7 +1,13 @@
 *
+!/.gitignore.d
 !/.gitignore.d/scripts
+!/.scripts
 !/.scripts/brew-cask-cleanup.rb
 !/.scripts/do-tmp.sh
 !/.scripts/exec-kubectl.sh
+!/.scripts/git-ff-all
+!/.scripts/git-pr-cleanup
 !/.scripts/gitstandup.sh
+!/.scripts/mr-daily
+!/.scripts/mr-repos-config
 !/.scripts/update-vcsh-gitignores.sh

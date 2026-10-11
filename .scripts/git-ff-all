@@ -1,0 +1,126 @@
+#!/bin/sh
+# Fetch all remotes, then bring every local branch up to its upstream: fast-forward when
+# only behind, rebase when it also has commits of its own (git replay when not checked out).
+# Branches checked out in a worktree are updated there. A fast-forward goes ahead over local
+# changes (git refuses it only when a changed file overlaps); a rebase needs a clean worktree.
+# others are moved without touching any working tree. rebase.updateRefs applies to the
+# checked-out rebase, so stacked local branches move with it.
+# In a fork with an `upstream` remote, the default branch follows the parent's default branch
+# rather than the fork's copy, without changing its tracking (push.default stays safe), and the
+# fork's copy on GitHub is pushed forward to the parent's tip when that is a fast-forward.
+# The resting branch `worktree` of a hand-made worktree (named *-worktree) is rebased onto the
+# default branch so it always starts from current main/master.
+# Every branch left behind is reported with a reason, so a silent line means nothing to do.
+# A branch with branch.<name>.mrIgnore=true is left alone and never reported.
+set -e
+git fetch --all --prune --quiet
+tab=$(printf '\t')
+default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+
+# The parent's default branch as fetched into refs/remotes/upstream/: the single branch named
+# by the narrowed remote.upstream.fetch refspec, else the fork's default branch name.
+upstream_default() {
+  name=$(git config --get remote.upstream.fetch 2>/dev/null | sed -nE 's#^\+?refs/heads/([^:*]+):.*#\1#p')
+  name=${name:-$default_branch}
+  git rev-parse --verify --quiet "refs/remotes/upstream/$name" >/dev/null && echo "upstream/$name"
+  return 0
+}
+
+# ff_branch <branch> <target ref> <worktree path or empty>
+ff_branch() {
+  branch=$1 target=$2 worktree=$3
+  counts=$(git rev-list --left-right --count "refs/heads/$branch...$target")
+  ahead=${counts%%"$tab"*} behind=${counts##*"$tab"}
+  [ "$behind" = 0 ] && return 0
+  if [ -n "$worktree" ]; then
+    if [ "$ahead" = 0 ]; then
+      # A fast-forward over local changes is safe: git refuses it when any touched file overlaps.
+      if git -C "$worktree" merge --ff-only --quiet "$target" >/dev/null 2>&1; then
+        echo "ff    $branch (behind $behind from $target) in $worktree"
+      elif [ -n "$(git -C "$worktree" status --porcelain --untracked-files=no)" ]; then
+        echo "skip  $branch (behind $behind): local changes overlap the incoming commits in $worktree"
+      else
+        echo "skip  $branch (behind $behind): fast-forward failed in $worktree"
+      fi
+    elif [ -n "$(git -C "$worktree" status --porcelain --untracked-files=no)" ]; then
+      echo "skip  $branch (ahead $ahead, behind $behind): needs a rebase but the worktree is dirty: $worktree"
+    elif git -C "$worktree" rebase --quiet "$target" >/dev/null 2>&1; then
+      echo "rebase  $branch (ahead $ahead) onto $target in $worktree"
+    else
+      git -C "$worktree" rebase --abort >/dev/null 2>&1 || true
+      echo "conflict  $branch (ahead $ahead, behind $behind) does not rebase cleanly onto $target in $worktree"
+    fi
+  elif [ "$ahead" = 0 ]; then
+    if git update-ref "refs/heads/$branch" "$target" "refs/heads/$branch"; then
+      echo "ff    $branch (behind $behind from $target)"
+    else
+      echo "skip  $branch (behind $behind): could not move the ref"
+    fi
+  elif git replay --onto "$target" "$target..refs/heads/$branch" >/dev/null 2>&1; then
+    echo "rebase  $branch (ahead $ahead) onto $target"
+  else
+    echo "conflict  $branch (ahead $ahead, behind $behind) does not rebase cleanly onto $target"
+  fi
+}
+
+upstream_ref=$(upstream_default)
+# Branches with a rebase paused in some worktree: HEAD is detached there, so they would otherwise
+# look unchecked-out and get moved under the user.
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+mid_rebase=$(cat "$common"/rebase-merge/head-name "$common"/rebase-apply/head-name "$common"/worktrees/*/rebase-merge/head-name "$common"/worktrees/*/rebase-apply/head-name 2>/dev/null | sed 's#^refs/heads/##')
+git for-each-ref --format='%(refname:short)%09%(if)%(upstream:short)%(then)%(upstream:short)%(else)-%(end)%09%(if)%(worktreepath)%(then)%(worktreepath)%(else)-%(end)' refs/heads |
+while IFS="$tab" read -r branch upstream worktree; do
+  [ "$upstream" = - ] && upstream=
+  [ "$worktree" = - ] && worktree=
+  [ "$(git config --get "branch.$branch.mrIgnore")" = true ] && continue
+  if echo "$mid_rebase" | grep -qx "$branch"; then
+    echo "skip  $branch: a rebase is in progress on it"
+    continue
+  fi
+  [ "$branch" = "$default_branch" ] && [ -n "$upstream_ref" ] && upstream=$upstream_ref
+  [ -z "$upstream" ] && continue
+  git rev-parse --verify --quiet "$upstream" >/dev/null || continue
+  ff_branch "$branch" "$upstream" "$worktree"
+done
+
+[ -z "$default_branch" ] && exit 0
+
+# Keep the fork's copy of the default branch equal to the parent's. Only the parent's commits are
+# pushed, never the local branch, so local WIP stays local; a fork branch with commits of its own
+# is reported and left alone.
+# Forks under the cvpartner org are left to their own rules.
+case "$(git remote get-url origin)" in *github.com[:/]cvpartner/*) upstream_ref= ;; esac
+if [ -n "$upstream_ref" ] && git rev-parse --verify --quiet "refs/remotes/origin/$default_branch" >/dev/null; then
+  fork_tip=$(git rev-parse "refs/remotes/origin/$default_branch")
+  parent_tip=$(git rev-parse "refs/remotes/$upstream_ref")
+  if [ "$fork_tip" != "$parent_tip" ]; then
+    if git merge-base --is-ancestor "$fork_tip" "$parent_tip"; then
+      if git push --quiet origin "refs/remotes/$upstream_ref:refs/heads/$default_branch" >/dev/null 2>&1; then
+        echo "push  origin/$default_branch (behind $(git rev-list --count "$fork_tip..$parent_tip") from $upstream_ref)"
+      else
+        echo "skip  origin/$default_branch: push of $upstream_ref to the fork failed"
+      fi
+    else
+      echo "skip  origin/$default_branch: the fork has commits of its own, not synced from $upstream_ref"
+    fi
+  fi
+fi
+
+git show-ref --quiet "refs/heads/$default_branch" || exit 0
+git worktree list --porcelain | awk '/^worktree /{w=$2} /^branch /{sub("refs\\/heads\\/","",$2); print w "\t" $2}' |
+while IFS="$tab" read -r worktree branch; do
+  case "$worktree" in *-worktree) ;; *) continue ;; esac
+  [ "$branch" = worktree ] || continue
+  git rev-parse --verify --quiet "$branch@{upstream}" >/dev/null && continue
+  git merge-base --is-ancestor "refs/heads/$default_branch" "refs/heads/$branch" && continue
+  if [ -n "$(git -C "$worktree" status --porcelain --untracked-files=no)" ]; then
+    echo "skip  $branch: needs rebase onto $default_branch but worktree is dirty: $worktree"
+    continue
+  fi
+  if git -C "$worktree" rebase --quiet "$default_branch" >/dev/null 2>&1; then
+    echo "rebase  $branch onto $default_branch in $worktree"
+  else
+    git -C "$worktree" rebase --abort >/dev/null 2>&1 || true
+    echo "conflict  $branch does not rebase cleanly onto $default_branch in $worktree"
+  fi
+done

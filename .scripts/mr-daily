@@ -1,0 +1,71 @@
+#!/bin/sh
+# Daily repo sync for launchd: runs mr update over ~/repos and posts a macOS notification
+# when anything needs a look (a branch left behind, a git error, a failed repo, an unarchived repo).
+# A clean run is silent. Logs are kept per day for 30 days under ~/Library/Logs/mr-update/.
+# If GitHub is unreachable, it waits up to two hours before giving up for the day.
+# One run at a time: a second start while one is running logs `busy`, notifies and exits.
+logdir="$HOME/Library/Logs/mr-update"
+mkdir -p "$logdir"
+log="$logdir/$(date +%Y-%m-%d).log"
+find "$logdir" -name '[0-9]*.log' -mtime +30 -delete
+
+# Clicking the notification opens the log directory; without terminal-notifier it is a plain banner.
+notify() {
+  if command -v terminal-notifier >/dev/null; then
+    terminal-notifier -title "mr update" -message "$1" -group mr-update -open "file://$logdir" >/dev/null
+  else
+    osascript -e "display notification \"$1\" with title \"mr update\""
+  fi
+}
+
+lock="$logdir/running.pid"
+if [ -f "$lock" ] && ps -o command= -p "$(cat "$lock")" 2>/dev/null | grep -qE '(^|/)sh .*/mr-daily$'; then
+  echo "busy  $(date +%H:%M:%S) a run started by pid $(cat "$lock") is still going" >> "$log"
+  notify "a previous run is still going (pid $(cat "$lock"))"
+  exit 0
+fi
+echo $$ > "$lock"
+trap 'rm -f "$lock"' EXIT
+
+# A dead SSH connection is noticed within 90 seconds instead of hanging the run.
+export GIT_SSH_COMMAND='ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3'
+
+
+online() { nc -z -w 5 github.com 22 >/dev/null 2>&1; }
+waited=0
+until online; do
+  if [ "$waited" -ge 7200 ]; then
+    echo "offline  $(date +%H:%M:%S) github.com unreachable for two hours, giving up until tomorrow" >> "$log"
+    notify "GitHub unreachable, repos not updated today"
+    exit 0
+  fi
+  sleep 600
+  waited=$((waited + 600))
+done
+[ "$waited" -gt 0 ] && echo "offline  $(date +%H:%M:%S) github.com was unreachable for $((waited / 60)) minutes before this run" >> "$log"
+
+touch "$log"
+first_line=$(( $(wc -l < "$log") + 1 ))
+{
+  echo "run started $(date +%H:%M:%S)"
+  gtimeout 3h mr -d "$HOME/repos" update || echo "fatal: mr exited with status $? (3h cap or failure)"
+  echo "run ended $(date +%H:%M:%S)"
+} >> "$log" 2>&1
+
+# Clones skipped as archived rejoin the daily job once GitHub reports them unarchived.
+for dir in "$HOME"/repos/*/; do
+  dir=${dir%/}
+  [ "$(git -C "$dir" config --get mr.skip)" = archived ] || continue
+  slug=$(git -C "$dir" remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')
+  [ "$(gh api "repos/$slug" --jq .archived 2>/dev/null)" = false ] || continue
+  git -C "$dir" config --unset mr.skip
+  echo "unarchived  $slug is no longer archived: back in the daily job from tomorrow" >> "$log"
+done
+
+# Only this run's lines count: the day's file may hold earlier runs.
+this_run=$(tail -n +"$first_line" "$log")
+summary=$(echo "$this_run" | grep '^mr update: finished' | sed 's/^mr update: //')
+needs_look=$(echo "$this_run" | grep -cE '^(skip|conflict|gone|unarchived|fatal:|error:) ')
+if [ "$needs_look" -gt 0 ] || ! echo "$this_run" | grep -q '^mr update: finished ([0-9]* ok)$'; then
+  notify "${summary:-mr did not finish}, $needs_look items need a look ($(basename "$log"))"
+fi
